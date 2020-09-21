@@ -21,6 +21,7 @@ log_error(string, prefix="[ERROR]") {
 
 ;~ dllPath := "WebSocketAsio-" . ARCH_LABEL . ".dll"
 dllPath := "WebSocketAsio-" . ARCH_LABEL . ".dll"
+;~ log_debug(A_LineFile)
 log_debug("Loading dll file: " . dllPath)
 hModule := DllCall("LoadLibrary", "Str", dllPath, "Ptr")
 if(A_LastError != 0) {

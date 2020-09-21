@@ -2,6 +2,7 @@
 ; *************** Author: Alex <pdckxd@gmail.com>
 ; *************** Add path which WebSocketAsio.dll resides in. Please modify 'AllPath' based on your requirement
 ; ******************************************************************************************************************************
+#SingleInstance force
 EnvGet, SysPath, PATH
 ;~ Important!!!! Please set correctly dll folder according to your environment
 AllPath = %A_ScriptDir%\..\bin\;%SysPath%
