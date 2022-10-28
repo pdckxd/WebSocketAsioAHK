@@ -21,8 +21,8 @@ else()
     set(arch x86)
 endif()
 
-include_directories(C:/boost_1_73_0)
-link_directories(C:/boost_1_73_0/stage/lib/)
+include_directories(C:/boost_1_80_0)
+link_directories(C:/boost_1_80_0/bin/${arch}/lib/)
 #link_libraries(libboost_regex-vc142-mt-x32-1_73.lib)
 
 

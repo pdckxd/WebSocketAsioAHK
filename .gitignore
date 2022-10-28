@@ -35,3 +35,6 @@
 
 /cmake-build-release/
 /cmake-build-debug/
+/.vs/
+/build/
+/out/build/
