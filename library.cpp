@@ -38,33 +38,66 @@ boost::mutex mtx_;
 // To indicate if the server is running or not
 bool Is_Connected = false;
 
-
-// Convert a wide Unicode string to an UTF8 string
-std::string utf8_encode(const std::wstring &wstr)
+std::string utf8_encode(std::wstring const& wstr)
 {
-    if (wstr.empty()) return std::string();
+    if (wstr.empty()) {
+        return {};
+    }
+#if _WIN32 || _WIN64
     int size_needed = WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), NULL, 0, NULL, NULL);
     std::string strTo(size_needed, 0);
     WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), &strTo[0], size_needed, NULL, NULL);
     return strTo;
+#else
+    std::mbstate_t state{};
+
+    auto in         = wstr.c_str();
+    int size_needed = std::wcsrtombs(nullptr, &in, wstr.size(), &state);
+
+    std::string strTo(1 + size_needed, 0);
+    size_t n = std::wcsrtombs(strTo.data(), &in, wstr.size(), &state);
+
+    if (n == -1ul) {
+        throw std::domain_error("wcsrtombs");
+    }
+    strTo.resize(n);
+    return strTo;
+#endif
 }
 
 // Convert an UTF8 string to a wide Unicode String
-std::wstring utf8_decode(const std::string &str)
+std::wstring utf8_decode(std::string const& str)
 {
-    if (str.empty()) return std::wstring();
+    if (str.empty()) {
+        return {};
+    }
+#if _WIN32 || _WIN64
     int size_needed = MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), NULL, 0);
     std::wstring wstrTo(size_needed, 0);
     MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), &wstrTo[0], size_needed);
     return wstrTo;
-}
+#else
+    std::mbstate_t state{};
 
+    char const* in     = str.c_str();
+    size_t size_needed = std::mbsrtowcs(nullptr, &in, 0, &state);
+
+    std::wstring wstrTo(1 + size_needed, 0);
+    size_needed = std::mbsrtowcs(wstrTo.data(), &in, wstrTo.size(), &state);
+
+    if (size_needed == -1ul) {
+        throw std::domain_error("mbsrtowcs");
+    }
+    wstrTo.resize(size_needed);
+    return wstrTo;
+#endif
+}
 
 /// Print error related information in stderr
 /// \param ec instance that contains error related information
 /// \param what customize prefix in output
-void fail(beast::error_code ec, wchar_t const *what) {
-    std::cerr << what << L": " << ec.message() << std::endl;
+void fail(beast::error_code ec, wchar_t const* what) {
+    std::wcerr << what << L": " << utf8_decode(ec.message()) << std::endl;
 }
 
 class session : public std::enable_shared_from_this<session> {
@@ -90,10 +123,10 @@ public:
         if(EnableVerbose)
             std::wcout << L"<WsDll-" ARCH_LABEL ">> Sending message: " << data << std::endl;
 
-        const std::string to_send = utf8_encode(data);
+      const std::string to_send = utf8_encode(data);
 
-        ws_.async_write(
-                net::buffer(to_send),
+      ws_.async_write(
+          net::buffer(to_send),
                 beast::bind_front_handler(
                         &session::on_write,
                         shared_from_this()));
