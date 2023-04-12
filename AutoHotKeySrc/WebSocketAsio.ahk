@@ -40,7 +40,7 @@ if(A_LastError != 0) {
 websocketRegisterOnConnectCb(callbackName) {
 	global INT_TYPE
 	global ARCH_LABEL	
-	res := DllCall("WebSocketAsio-" . ARCH_LABEL . "\websocket_register_on_connect_cb", INT_TYPE, RegisterCallback("on_connect", "F", 0), "UChar")
+	res := DllCall("WebSocketAsio-" . ARCH_LABEL . "\websocket_register_on_connect_cb", INT_TYPE, RegisterCallback("on_connect", "", 0), "UChar")
 	if(A_LastError != 0) {
 		log_error("Register on connect callback Error: " . A_LastError)
 		log_debug("res: " . res)
@@ -53,7 +53,7 @@ websocketRegisterOnConnectCb(callbackName) {
 websocketRegisterOnDataCb(callbackName) {
 	global INT_TYPE
 	global ARCH_LABEL	
-	res := DllCall("WebSocketAsio-" . ARCH_LABEL . "\websocket_register_on_data_cb", INT_TYPE, RegisterCallback("on_data", "F", 2), "UChar")
+	res := DllCall("WebSocketAsio-" . ARCH_LABEL . "\websocket_register_on_data_cb", INT_TYPE, RegisterCallback("on_data", "", 2), "UChar")
 	if(A_LastError != 0) {
 		log_error("Register on data callback Error: " . A_LastError)
 		log_debug("res: " . res)
@@ -66,7 +66,7 @@ websocketRegisterOnDataCb(callbackName) {
 websocketRegisterOnFailCb(callbackName) {
 	global INT_TYPE
 	global ARCH_LABEL	
-	res := DllCall("WebSocketAsio-" . ARCH_LABEL . "\websocket_register_on_fail_cb", INT_TYPE, RegisterCallback("on_fail", "F", 1), "UChar")
+	res := DllCall("WebSocketAsio-" . ARCH_LABEL . "\websocket_register_on_fail_cb", INT_TYPE, RegisterCallback("on_fail", "", 1), "UChar")
 	if(A_LastError != 0) {
 		log_error("Register on fail callback Error: " . A_LastError)
 		log_debug("res: " . res)
@@ -79,7 +79,7 @@ websocketRegisterOnFailCb(callbackName) {
 websocketRegisterOnDisconnectCb(callbackName) {
 	global INT_TYPE
 	global ARCH_LABEL	
-	res := DllCall("WebSocketAsio-" . ARCH_LABEL . "\websocket_register_on_disconnect_cb", INT_TYPE, RegisterCallback("on_disconnect", "F", 0), "UChar")
+	res := DllCall("WebSocketAsio-" . ARCH_LABEL . "\websocket_register_on_disconnect_cb", INT_TYPE, RegisterCallback("on_disconnect", "", 0), "UChar")
 	if(A_LastError != 0) {
 		log_error("Register on disconnect callback Error: " . A_LastError)
 		log_debug("res: " . res)
