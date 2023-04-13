@@ -137,13 +137,10 @@ namespace /*anon*/ {
 
         /// Send message to remote websocket server
         /// \param data to be sent
-        void send_message(std::wstring const& data)
+        void send_message(std::wstring data)
         {
-            VERBOSE(L"Sending message: " << data);
-
-            const std::string to_send = utf8_encode(data); // BIG OOPS! lifetime ends at function exit
-            ws_.async_write(net::buffer(to_send),
-                            beast::bind_front_handler(&Session::on_write, shared_from_this()));
+            post(ws_.get_executor(),
+                 std::bind(&Session::do_send_message, shared_from_this(), std::move(data)));
         }
 
         /// Close the connect between websocket client and server. It call
