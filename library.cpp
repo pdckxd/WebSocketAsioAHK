@@ -1,485 +1,400 @@
 #include "library.h"
-#include <boost/regex.hpp>
-#include <boost/beast/core.hpp>
-#include <boost/beast/websocket.hpp>
-#include <boost/asio/strand.hpp>
-#include <boost/thread/thread.hpp>
 #include <boost/algorithm/string.hpp>
-#include <cstdlib>
-#include <functional>
+#include <boost/asio.hpp>
+#include <boost/beast.hpp>
+#include <boost/regex.hpp>
+#include <iomanip>
 #include <iostream>
-#include <memory>
-#include <string>
-#include <map>
 
-namespace beast = boost::beast;         // from <boost/beast.hpp>
-namespace http = beast::http;           // from <boost/beast/http.hpp>
-namespace websocket = beast::websocket; // from <boost/beast/websocket.hpp>
-namespace net = boost::asio;            // from <boost/asio.hpp>
-using tcp = boost::asio::ip::tcp;       // from <boost/asio/ip/tcp.hpp>
+namespace net       = boost::asio;          // from <boost/asio.hpp>
+namespace beast     = boost::beast;         // from <boost/beast.hpp>
+namespace http      = beast::http;          // from <boost/beast/http.hpp>
+namespace websocket = beast::websocket;     // from <boost/beast/websocket.hpp>
+using tcp           = boost::asio::ip::tcp; // from <boost/asio/ip/tcp.hpp>
+using namespace std::chrono_literals;
 
-int EnableVerbose = 0;
+#define TRACE(stream, msg) do { stream << L"<WsDll-" ARCH_LABEL "> " << msg << std::endl; } while(0)
+#define VERBOSE(msg) do { if (s_enable_verbose) { TRACE(std::wcout, msg); } } while(0)
+#define COUT(msg) TRACE(std::wcout, msg)
+#define CERR(msg) TRACE(std::wcerr, msg)
 
-class session;
+namespace /*anon*/ {
+    static on_connect_t    s_on_connect_cb{nullptr};
+    static on_fail_t       s_on_fail_cb{nullptr};
+    static on_disconnect_t s_on_disconnect_cb{nullptr};
+    static on_data_t       s_on_data_cb{nullptr};
 
-on_connect_t on_connect_cb = nullptr;
-on_fail_t on_fail_cb = nullptr;
-on_disconnect_t on_disconnect_cb = nullptr;
-on_data_t on_data_cb = nullptr;
+    // Global variables
+    static std::atomic_bool s_enable_verbose{false};
 
-// Global variables
-net::io_context Ioc;
-// Global instance of session class which contains callback functions to handle websocket async operations.
-std::shared_ptr<session> Session_Ioc;
-// Make sure the io_context thread exists through whole dll lifecycle until Ioc.run() is unblocked
-boost::thread New_Thread;
-// This is for making sure we won't get dirty Is_Connected value from main thread or io_context thread
-boost::mutex mtx_;
-// To indicate if the server is running or not
-bool Is_Connected = false;
+    class Session;
+    using SessionPtr = std::shared_ptr<Session>;
 
-
-// Convert a wide Unicode string to an UTF8 string
-std::string utf8_encode(const std::wstring &wstr)
-{
-    if (wstr.empty()) return std::string();
-    int size_needed = WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), NULL, 0, NULL, NULL);
-    std::string strTo(size_needed, 0);
-    WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), &strTo[0], size_needed, NULL, NULL);
-    return strTo;
-}
-
-// Convert an UTF8 string to a wide Unicode String
-std::wstring utf8_decode(const std::string &str)
-{
-    if (str.empty()) return std::wstring();
-    int size_needed = MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), NULL, 0);
-    std::wstring wstrTo(size_needed, 0);
-    MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), &wstrTo[0], size_needed);
-    return wstrTo;
-}
-
-
-/// Print error related information in stderr
-/// \param ec instance that contains error related information
-/// \param what customize prefix in output
-void fail(beast::error_code ec, wchar_t const *what) {
-    std::cerr << what << L": " << ec.message() << std::endl;
-}
-
-class session : public std::enable_shared_from_this<session> {
-    tcp::resolver resolver_;
-    websocket::stream<beast::tcp_stream> ws_;
-    beast::flat_buffer buffer_;
-    std::wstring host_;
-    // path part in url. For example: /v2/ws
-    std::wstring path_;
-    std::wstring text_;
-    bool is_first_write_;
-
-public:
-    /// Resolver and socket require an io_context
-    /// \param ioc
-    explicit
-    session(net::io_context &ioc)
-            : resolver_(net::make_strand(ioc)), ws_(net::make_strand(ioc)), is_first_write_(false) {
-    }
-    /// Send message to remote websocket server
-    /// \param data to be sent
-    void send_message(const std::wstring &data) {
-        if(EnableVerbose)
-            std::wcout << L"<WsDll-" ARCH_LABEL ">> Sending message: " << data << std::endl;
-
-        const std::string to_send = utf8_encode(data);
-
-        ws_.async_write(
-                net::buffer(to_send),
-                beast::bind_front_handler(
-                        &session::on_write,
-                        shared_from_this()));
-    }
-
-    /// Close the connect between websocket client and server. It call async_close to call a callback function which also calls user registered callback function to deal with close event.
-    void disconnect() {
-        if(EnableVerbose)
-            std::wcout << L"<WsDll-" ARCH_LABEL "> Disconnecting" << std::endl;
-
-        ws_.async_close(websocket::close_code::normal,
-                        beast::bind_front_handler(
-                                &session::on_close,
-                                shared_from_this()));
-    }
-
-    /// Start the asynchronous operation
-    /// \param host host to be connected
-    /// \param port tcp port to be connected
-    /// \param text <not used>
-    void
-    run(
-            wchar_t const *host,
-            wchar_t const *port,
-            wchar_t const *path,
-            wchar_t const *text) {
-        // Save these for later
-        host_ = host;
-        text_ = text;
-        path_ = path;
-
-//        std::wcout << L"host_: " << host << L", port: " << port << L", path_: " << path_ << std::endl;
-
-        const std::string utf_host = utf8_encode(host);
-        const std::wstring w_port(port);
-        const std::string utf_port = utf8_encode(port);
-
-        // Look up the domain name
-        resolver_.async_resolve(
-                utf_host,
-                utf_port,
-                beast::bind_front_handler(
-                        &session::on_resolve,
-                        shared_from_this()));
-    }
-
-    /// Callback function registered by async_resolve method. It is called after resolve operation is done. It will call async_connect to issue async connecting operation with callback function
-    /// \param ec
-    /// \param results
-    void
-    on_resolve(
-            beast::error_code ec,
-            const tcp::resolver::results_type &results) {
-        if (ec) {
-            if(on_fail_cb)
-                on_fail_cb(L"resolve");
-            return fail(ec, L"resolve");
-        }
-
-        // Set the timeout for the operation
-        beast::get_lowest_layer(ws_).expires_after(std::chrono::seconds(30));
-
-        // Make the connection on the IP address we get from a lookup
-        beast::get_lowest_layer(ws_).async_connect(
-                results,
-                beast::bind_front_handler(
-                        &session::on_connect,
-                        shared_from_this()));
-    }
-
-    /// Callback function registered by async_connect method. In callback function, it call async_handshake to actually do websocket handshake operation and register on_handshake callback.
-    /// \param ec instance of error code
-    /// \param ep endpoint type.
-    void
-    on_connect(beast::error_code ec, tcp::resolver::results_type::endpoint_type ep) {
-        if(EnableVerbose)
-            std::wcout << L"<WsDll-" ARCH_LABEL "> in on connect" << std::endl;
-        if (ec) {
-            if(on_fail_cb)
-                on_fail_cb(L"connect");
-            return fail(ec, L"connect");
-        }
-
-        // Turn off the timeout on the tcp_stream, because
-        // the websocket stream has its own timeout system.
-        beast::get_lowest_layer(ws_).expires_never();
-
-        // Set suggested timeout settings for the websocket
-        ws_.set_option(
-                websocket::stream_base::timeout::suggested(
-                        beast::role_type::client));
-
-        // Set a decorator to change the User-Agent of the handshake
-        ws_.set_option(websocket::stream_base::decorator(
-                [](websocket::request_type &req) {
-                    req.set(http::field::user_agent,
-                            std::string(BOOST_BEAST_VERSION_STRING) +
-                                    " websocket-client-async");
-                }));
-
-        // Update the host_ string. This will provide the value of the
-        // Host HTTP header during the WebSocket handshake.
-        // See https://tools.ietf.org/html/rfc7230#section-5.4
-        host_ += L':' + std::to_wstring(ep.port());
-
-        std::string utf_host = utf8_encode(host_);
-        std::string utf_path = utf8_encode(path_);
-
-        // Perform the websocket handshake
-        ws_.async_handshake(utf_host, utf_path,
-                            beast::bind_front_handler(
-                                    &session::on_handshake,
-                                    shared_from_this()));
-    }
-
-    /// Callback function registered by async_handshake. In callback function, it calls async_read to waiting for data from websocket server.
-    /// \param ec instance of error code
-    void
-    on_handshake(beast::error_code ec) {
-        if(EnableVerbose)
-            std::wcout << L"<WsDll-" ARCH_LABEL "> in on handshake" << std::endl;
-        if (ec) {
-            if(on_fail_cb)
-                on_fail_cb(L"handshake");
-            return fail(ec, L"handshake");
-        }
-
-        if (on_connect_cb)
-            on_connect_cb();
-
-        // Send the message
-        if(EnableVerbose)
-            std::wcout << L"<WsDll-" ARCH_LABEL "> issue new async_read in on_handshake" << std::endl;
-        ws_.async_read(
-                buffer_,
-                beast::bind_front_handler(
-                        &session::on_read,
-                        shared_from_this()));
-//        ws_.async_write(
-//                net::buffer(text_),
-//                beast::bind_front_handler(
-//                        &session::on_write,
-//                        shared_from_this()));
-    }
-
-    /// Callback registered by async_write. It issue an async_read call to wait for data from websocket server
-    /// \param ec instance of error code
-    /// \param bytes_transferred count of bytes which is sent to server
-    void
-    on_write(
-            beast::error_code ec,
-            std::size_t bytes_transferred) {
-        if(EnableVerbose)
-            std::wcout << L"<WsDll-" ARCH_LABEL "> in on write" << std::endl;
-        boost::ignore_unused(bytes_transferred);
-
-        if (ec) {
-            if(on_fail_cb)
-                on_fail_cb(L"write");
-            return fail(ec, L"write");
-        }
-
-        if(EnableVerbose)
-            std::wcout << L"<WsDll-" ARCH_LABEL "> issue new async_read in on_write" << std::endl;
-        ws_.async_read(
-                buffer_,
-                beast::bind_front_handler(
-                        &session::on_read,
-                        shared_from_this()));
-    }
-
-    /// Callback registered by async_read. It calls user registered callback to actually process the data. And then issue another async_read to wait for data from server again.
-    /// \param ec instance of error code
-    /// \param bytes_transferred
-    void
-    on_read(
-            beast::error_code ec,
-            std::size_t bytes_transferred) {
-        if(EnableVerbose)
-            std::wcout << L"<WsDll-" ARCH_LABEL "> in on read" << std::endl;
-        boost::ignore_unused(bytes_transferred);
-
+    struct Manager {
+        // TODO maybe allow multiple sessions and use weak pointers instead?
+        static inline SessionPtr Install(SessionPtr sess)
         {
-            boost::lock_guard<boost::mutex> guard(mtx_);
-            if(!Is_Connected) {
-                return;
+            std::shared_ptr<Session> no_session{};
+            if (!std::atomic_compare_exchange_strong(&s_instance_unsafe, &no_session, sess)) {
+                return nullptr;
             }
-
+            return sess;
         }
 
-        // error occurs
-        if (ec) {
-            if(on_fail_cb)
-                on_fail_cb(L"read");
-            return fail(ec, L"read");
+        static inline SessionPtr Active() {
+            return std::atomic_load(&s_instance_unsafe);
         }
 
-        const std::string data = beast::buffers_to_string(buffer_.data());
-        const std::wstring wdata(data.begin(), data.end());
-        if(EnableVerbose)
-            std::wcout << L"<WsDll-" ARCH_LABEL "> received[" << bytes_transferred << L"] " << wdata << std::endl;
+        static inline bool Clear(SessionPtr sess)
+        {
+            return std::atomic_compare_exchange_strong(&s_instance_unsafe, &sess, {});
+        }
 
-//        const std::string str(wdata.begin(), wdata.end());
+      private:
+        static SessionPtr s_instance_unsafe; // use atomic_ operations to safely access
+    };
+    /*static*/ SessionPtr Manager::s_instance_unsafe;
 
-        if (on_data_cb)
-            on_data_cb(wdata.c_str(), wdata.length());
+    std::string utf8_encode(std::wstring const& wstr)
+    {
+        if (wstr.empty()) {
+            return {};
+        }
+#if _WIN32 || _WIN64
+        int size_needed = WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), NULL, 0, NULL, NULL);
+        std::string strTo(size_needed, 0);
+        WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), &strTo[0], size_needed, NULL, NULL);
+        return strTo;
+#else // TODO review, should work on windows as well
+        std::mbstate_t state{};
 
-        buffer_.consume(buffer_.size());
+        auto in          = wstr.c_str();
+        int  size_needed = std::wcsrtombs(nullptr, &in, 0, &state);
 
-        if(EnableVerbose)
-            std::wcout << L"<WsDll-" ARCH_LABEL "> issue new async_read in on_read" << std::endl;
-        ws_.async_read(
-                buffer_,
-                beast::bind_front_handler(
-                        &session::on_read,
-                        shared_from_this()));
+        std::string strTo(1 + size_needed, 0);
+        size_t n = std::wcsrtombs(&strTo[0], &in, strTo.size(), &state);
 
-        // Close the WebSocket connection
-        // ws_.async_close(websocket::close_code::normal,
-        //     beast::bind_front_handler(
-        //         &session::on_close,
-        //         shared_from_this()));
+        if (n == -1ul) {
+            throw std::domain_error("wcsrtombs");
+        }
+        strTo.resize(n);
+        return strTo;
+#endif
     }
 
-    /// It is only called when client proactively closes connection by calling websocket_disconnect.
-    /// \param ec instance of error code
-    void
-    on_close(beast::error_code ec) {
-        if(EnableVerbose)
-            std::wcout << L"<WsDll-" ARCH_LABEL "> in on close" << std::endl;
-        if (ec)
-            fail(ec, L"close");
+    // Convert an UTF8 string to a wide Unicode String
+    std::wstring utf8_decode(std::string const& str)
+    {
+        if (str.empty()) {
+            return {};
+        }
+#if _WIN32 || _WIN64
+        int          size_needed = MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), NULL, 0);
+        std::wstring wstrTo(size_needed, 0);
+        MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), &wstrTo[0], size_needed);
+        return wstrTo;
+#else
+        std::mbstate_t state{};
 
-//        ws_.next_layer().cancel();
-//        ws_.next_layer().close();
-        Ioc.stop();
+        char const* in          = str.c_str();
+        size_t      size_needed = std::mbsrtowcs(nullptr, &in, 0, &state);
 
-        if (on_disconnect_cb)
-            on_disconnect_cb();
+        std::wstring wstrTo(1 + size_needed, 0);
+        size_t n = std::mbsrtowcs(&wstrTo[0], &in, wstrTo.size(), &state);
 
-        // If we get here then the connection is closed gracefully
-
-        // The make_printable() function helps print a ConstBufferSequence
-        // std::wcout << beast::make_printable(buffer_.data()) << std::endl;
+        if (n == -1ul) {
+            throw std::domain_error("mbsrtowcs");
+        }
+        wstrTo.resize(size_needed);
+        return wstrTo;
+#endif
     }
-};
 
-EXPORT void enable_verbose(intptr_t enabled) {
-    if(enabled)
-        std::wcout << L"<WsDll-" ARCH_LABEL "> Verbose output enabled" << std::endl;
-    else
-        std::wcout << L"<WsDll-" ARCH_LABEL "> Verbose output disabled" << std::endl;
+    class Session : public std::enable_shared_from_this<Session> {
+        net::thread_pool                     ioc_{1};
+        websocket::stream<beast::tcp_stream> ws_{make_strand(ioc_.get_executor())};
+        tcp::resolver                        resolver_{ws_.get_executor()};
 
-    EnableVerbose = enabled;
+        beast::flat_buffer buffer_;
+        std::wstring       host_, path_; // path part in url. For example: /v2/ws
+
+        /// Print error related information in stderr
+        /// \param ec instance that contains error related information
+        /// \param what customize prefix in output
+        void fail(beast::error_code ec, wchar_t const* what)
+        {
+            std::wstring const msg = what //
+                ? what + (L": " + utf8_decode(ec.message()))
+                : utf8_decode(ec.message());
+
+            if (s_on_fail_cb)
+                s_on_fail_cb(msg.c_str());
+            CERR(msg);
+        }
+
+      public:
+        Session() = default;
+
+        /// Send message to remote websocket server
+        /// \param data to be sent
+        void send_message(std::wstring data)
+        {
+            post(ws_.get_executor(),
+                 std::bind(&Session::do_send_message, shared_from_this(), std::move(data)));
+        }
+
+        /// Close the connect between websocket client and server. It call
+        /// async_close to call a callback function which also calls user
+        /// registered callback function to deal with close event.
+        void disconnect()
+        {
+            post(ws_.get_executor(), std::bind(&Session::do_disconnect, shared_from_this()));
+        }
+
+        /// Start the asynchronous operation
+        /// \param host host to be connected
+        /// \param port tcp port to be connected
+        void run(std::wstring host, std::wstring port, std::wstring path)
+        {
+            // Save these for later
+            host_ = std::move(host);
+            path_ = std::move(path);
+
+            VERBOSE(L"Run host_: " << host << L", port: " << port << L", path_: " << path_);
+
+            // Look up the domain name
+            resolver_.async_resolve(utf8_encode(host), utf8_encode(port),
+                                    beast::bind_front_handler(&Session::on_resolve, shared_from_this()));
+        }
+
+      private: // all private (do_*/on_*) assumed on strand
+        std::deque<std::wstring> _outbox; // NOTE: reference stability of elements
+
+        void do_send_message(std::wstring data)
+        {
+            VERBOSE(L"Sending message: " << data);
+            _outbox.push_back(std::move(data)); // extend lifetime to completion of async write
+
+            if (_outbox.size()==1) // need to start write chain?
+                do_write_loop();
+        }
+
+        void do_disconnect()
+        {
+            VERBOSE(L"Disconnecting");
+            ws_.async_close(websocket::close_code::normal,
+                            beast::bind_front_handler(&Session::on_close, shared_from_this()));
+        }
+
+        /// Callback function registered by async_resolve method. It is
+        /// called after resolve operation is done. It will call
+        /// async_connect to issue async connecting operation with
+        /// callback function
+        /// \param ec
+        /// \param results
+        void on_resolve(beast::error_code ec, tcp::resolver::results_type const& results)
+        {
+            VERBOSE(L"In on_resolve");
+            if (ec)
+                return fail(ec, L"resolve");
+
+            // Set the timeout for the operation
+            beast::get_lowest_layer(ws_).expires_after(30s);
+
+            // Make the connection on the IP address we get from a lookup
+            beast::get_lowest_layer(ws_).async_connect(
+                results, beast::bind_front_handler(&Session::on_connect, shared_from_this()));
+        }
+
+        void on_connect(beast::error_code ec, tcp::resolver::results_type::endpoint_type ep)
+        {
+            VERBOSE(L"In on_connect");
+            if (ec)
+                return fail(ec, L"connect");
+
+            // Turn off the timeout on the tcp_stream, because
+            // the websocket stream has its own timeout system.
+            beast::get_lowest_layer(ws_).expires_never();
+
+            // Set suggested timeout settings for the websocket
+            ws_.set_option(websocket::stream_base::timeout::suggested(beast::role_type::client));
+
+            // Set a decorator to change the User-Agent of the handshake
+            ws_.set_option(websocket::stream_base::decorator([](websocket::request_type& req) {
+                req.set(http::field::user_agent,
+                        std::string(BOOST_BEAST_VERSION_STRING) + " WsDll");
+            }));
+
+            // Perform the websocket handshake
+
+            // Host HTTP header includes the port. See https://tools.ietf.org/html/rfc7230#section-5.4
+            ws_.async_handshake(utf8_encode(host_) + ":" + std::to_string(ep.port()), utf8_encode(path_),
+                                beast::bind_front_handler(&Session::on_handshake, shared_from_this()));
+        }
+
+        void on_handshake(beast::error_code ec)
+        {
+            VERBOSE(L"In on_handshake");
+            if (ec)
+                return fail(ec, L"handshake");
+
+            if (s_on_connect_cb)
+                s_on_connect_cb();
+
+            // Send the message
+            VERBOSE(L"Issue async_read in on_handshake");
+            ws_.async_read(buffer_, beast::bind_front_handler(&Session::on_read, shared_from_this()));
+        }
+
+        void do_write_loop()
+        {
+            if (_outbox.empty())
+                return;
+
+            ws_.async_write(net::buffer(_outbox.front()),
+                            beast::bind_front_handler(&Session::on_write, shared_from_this()));
+        }
+
+        void on_write(beast::error_code ec, std::size_t bytes_transferred)
+        {
+            VERBOSE(L"In on_write");
+            boost::ignore_unused(bytes_transferred);
+
+            if (ec)
+                return fail(ec, L"write");
+
+            _outbox.pop_front();
+            do_write_loop(); // drain _outbox
+        }
+
+        void on_read(beast::error_code ec, std::size_t bytes_transferred)
+        {
+            VERBOSE(L"In on_read");
+
+            // error occurs
+            if (ec)
+                return fail(ec, L"read");
+
+            const std::wstring wdata = utf8_decode(beast::buffers_to_string(buffer_.data()));
+            VERBOSE(L"Received[" << bytes_transferred << L"] " << std::quoted(wdata));
+
+            if (s_on_data_cb)
+                s_on_data_cb(wdata.c_str(), wdata.length());
+
+            buffer_.consume(bytes_transferred); // some forms of async_read can read extra data
+
+            VERBOSE(L"Issue new async_read in on_read");
+            ws_.async_read(buffer_, beast::bind_front_handler(&Session::on_read, shared_from_this()));
+        }
+
+        /// Only called when client proactively closes connection by calling
+        /// websocket_disconnect. 
+        /// \param ec instance of error code
+        void on_close(beast::error_code ec)
+        {
+            VERBOSE(L"In on_close");
+            if (ec)
+                fail(ec, L"close");
+
+            if (s_on_disconnect_cb)
+                s_on_disconnect_cb();
+
+            get_lowest_layer(ws_).cancel(); // cause all async operations to abort
+
+            if (!Manager::Clear(shared_from_this())) {
+                // CERR(L"Could not remove active session"); // redundant message when Sessions::Install fails
+            }
+        }
+    };
 }
 
-EXPORT size_t websocket_connect(const wchar_t *szServer) {
-    {
-        boost::lock_guard<boost::mutex> guard(mtx_);
-        if(Is_Connected) {
-            std::wcerr << L"<WsDll-" ARCH_LABEL "> Server is running. Can't run again." << std::endl;
-            return 0;
-        }
+EXPORT void enable_verbose(intptr_t enabled)
+{
+    COUT(L"Verbose output " << (enabled ? "enabled" : "disabled"));
+    s_enable_verbose = enabled;
+}
+
+EXPORT size_t websocket_connect(wchar_t const* szServer)
+{
+    auto new_session = Manager::Install(std::make_shared<Session>());
+    if (!new_session) {
+        COUT(L"A session is already active.");
+        return 0;
     }
+    assert(new_session == Manager::Active());
 
+    VERBOSE(L"Connecting to the server: " << szServer);
 
-    boost::regex pat(R"(^wss?://([\w\.]+):(\d+)(.*)$)");
+    static boost::wregex const s_pat(LR"(^wss?://([\w\.]+):(\d+)(.*)$)");
 
-    const std::wstring line(szServer);
-    const std::string utf_line = utf8_encode(line);
-
-    boost::smatch matches;
-    if (!boost::regex_match(utf_line, matches, pat)) {
-        std::wcerr << L"<WsDll-" ARCH_LABEL "> failed to parse host & port. Correct example: ws://localhost:8080/" << std::endl;
+    boost::wsmatch matches;
+    if (!boost::regex_match(std::wstring(szServer), matches, s_pat)) {
+        COUT(L"Failed to parse host & port. Correct example: ws://localhost:8080/");
         return 0;
     }
 
-    const std::wstring host(matches[1].begin(), matches[1].end());
-    const std::wstring port(matches[2].begin(), matches[2].end());
-    const std::wstring path(matches[3].begin(), matches[3].end());
-    if(EnableVerbose)
-        std::wcout << L"<WsDll-" ARCH_LABEL "> host: " << host << L", port: " << port << L", path: " << path << std::endl;
+    std::wstring path(boost::trim_copy(matches[3].str()));
+    if (path.empty())
+        path = L"/";
 
-    if(EnableVerbose)
-        std::wcout << L"<WsDll-" ARCH_LABEL "> Connecting to the server: " << szServer << std::endl;
-
-    Session_Ioc = std::make_shared<session>(Ioc);
-    // must pass value to lambda otherwise it will cause unexpected exit (no any error message)
-    New_Thread = boost::thread([path, host, port]() {
-        if(EnableVerbose)
-            std::wcout << L"<WsDll-" ARCH_LABEL "> in thread" << std::endl;
-        Ioc.stop();
-        Ioc.reset();
-        std::wstring tmp_path = path;
-        boost::trim(tmp_path);
-        if(tmp_path.empty()) {
-            tmp_path.append(L"/");
-        }
-        Session_Ioc->run(host.c_str(), port.c_str(), tmp_path.c_str(), L"");
-        {
-            boost::lock_guard<boost::mutex> guard(mtx_);
-            Is_Connected = true;
-        }
-        if(EnableVerbose)
-            std::wcout << L"<WsDll-" ARCH_LABEL "> Calling Ioc.run()" << std::endl;
-        Ioc.run();
-        if(EnableVerbose)
-            std::wcout << L"<WsDll-" ARCH_LABEL "> After calling Ioc.run()" << std::endl;
-        {
-            boost::lock_guard<boost::mutex> guard(mtx_);
-            Is_Connected = false;
-        }
-        Ioc.stop();
-    });
+    new_session->run(matches[1], matches[2], std::move(path));
 
     return 1;
 }
 
-EXPORT size_t websocket_disconnect() {
-    {
-        boost::lock_guard<boost::mutex> guard(mtx_);
-        if(!Is_Connected) {
-            std::wcerr << L"<WsDll-" ARCH_LABEL "> Server is not running. Can't disconnect." << std::endl;
-            return 0;
-        }
+EXPORT size_t websocket_disconnect()
+{
+    if (SessionPtr sess = Manager::Active()) {
+        sess->disconnect();
+        return 1;
     }
-    {
-        boost::lock_guard<boost::mutex> guard(mtx_);
-        Is_Connected = false;
-        if(EnableVerbose)
-            std::wcout << L"<WsDll-" ARCH_LABEL "> Connection is closed after Ioc.run() is completed." << std::endl;
+    CERR(L"Session not active. Can't disconnect.");
+    return 0;
+}
+
+EXPORT size_t websocket_send(wchar_t const* szMessage, size_t dwLen, bool isBinary)
+{
+    if (SessionPtr sess = Manager::Active()) {
+        sess->send_message(szMessage);
+        return 1;
     }
-
-    Session_Ioc->disconnect();
-    return 1;
+    CERR(L"Session not active. Can't send data.");
+    return 0;
 }
 
-EXPORT size_t websocket_send(const wchar_t *szMessage, size_t dwLen, bool isBinary) {
-    {
-        boost::lock_guard<boost::mutex> guard(mtx_);
-        if(!Is_Connected) {
-            std::wcerr << L"<WsDll-" ARCH_LABEL "> Server is not running. Can't send data." << std::endl;
-            return 0;
-        }
-    }
-
-    Session_Ioc->send_message(szMessage);
-
-    return 1;
+EXPORT size_t websocket_isconnected()
+{
+    return Manager::Active() != nullptr;
 }
 
-EXPORT size_t websocket_isconnected() {
-    {
-        boost::lock_guard<boost::mutex> guard(mtx_);
-        return Is_Connected ? 1 : 0;
-    }
-}
-
-EXPORT size_t websocket_register_on_connect_cb(size_t dwAddress) {
-    if(EnableVerbose)
-        std::wcout << L"<WsDll-" ARCH_LABEL "> registering on_connect callback" << std::endl;
-    on_connect_cb = reinterpret_cast<on_connect_t>(dwAddress);
+EXPORT size_t websocket_register_on_connect_cb(size_t dwAddress)
+{
+    VERBOSE(L"Registering on_connect callback");
+    s_on_connect_cb = reinterpret_cast<on_connect_t>(dwAddress);
 
     return 1;
 }
 
-EXPORT size_t websocket_register_on_fail_cb(size_t dwAddress) {
-    if(EnableVerbose)
-        std::wcout << L"<WsDll-" ARCH_LABEL "> registering on_fail callback" << std::endl;
-    on_fail_cb = reinterpret_cast<on_fail_t>(dwAddress);
+EXPORT size_t websocket_register_on_fail_cb(size_t dwAddress)
+{
+    VERBOSE(L"Registering on_fail callback");
+    s_on_fail_cb = reinterpret_cast<on_fail_t>(dwAddress);
 
     return 1;
 }
 
-EXPORT size_t websocket_register_on_disconnect_cb(size_t dwAddress) {
-    if(EnableVerbose)
-        std::wcout << L"<WsDll-" ARCH_LABEL "> registering on_disconnect callback" << std::endl;
-    on_disconnect_cb = reinterpret_cast<on_disconnect_t>(dwAddress);
+EXPORT size_t websocket_register_on_disconnect_cb(size_t dwAddress)
+{
+    VERBOSE(L"Registering on_disconnect callback");
+    s_on_disconnect_cb = reinterpret_cast<on_disconnect_t>(dwAddress);
 
     return 1;
 }
 
-EXPORT size_t websocket_register_on_data_cb(size_t dwAddress) {
-    if(EnableVerbose)
-        std::wcout << L"<WsDll-" ARCH_LABEL "> registering on_data callback" << std::endl;
-    on_data_cb = reinterpret_cast<on_data_t>(dwAddress);
+EXPORT size_t websocket_register_on_data_cb(size_t dwAddress)
+{
+    VERBOSE(L"Registering on_data callback");
+    s_on_data_cb = reinterpret_cast<on_data_t>(dwAddress);
 
     return 1;
 }
